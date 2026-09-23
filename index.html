@@ -74,6 +74,22 @@
     line-height:1.7; color:#bcd4ff; white-space:pre; display:none;
   }
 
+  #jev-log{
+    position:fixed; bottom:52px; left:50%; transform:translateX(-50%);
+    z-index:7; width:min(620px, 90vw); max-height:170px; overflow:auto;
+    padding:10px 14px; font-family:var(--font-mono); font-size:11px;
+    line-height:1.6; color:#bcd4ff; white-space:pre-wrap; display:none;
+  }
+
+  #jev-goal-banner{
+    position:fixed; top:0; left:0; right:0; z-index:9;
+    display:none; justify-content:center; padding-top:22px; pointer-events:none;
+  }
+  #jev-goal-panel{
+    padding:12px 22px; font-size:14px; font-weight:500;
+    color:var(--accent); letter-spacing:0.02em;
+  }
+
   #loading, #start{
     position:fixed; inset:0; z-index:20;
     display:flex; align-items:center; justify-content:center;
@@ -127,13 +143,16 @@
     <div class="row"><span class="label">バイオーム</span><span class="value" id="hud-biome">—</span></div>
     <div class="row"><span class="label">時刻</span><span class="value" id="hud-time">—:—</span></div>
     <div class="row"><span class="label">移動</span><span class="value" id="hud-mode">—</span></div>
+    <div class="row"><span class="label">Jev</span><span class="value" id="hud-jev">OFF (J)</span></div>
   </div>
 
   <div id="hint">
-    <b>F</b> 飛行切替 &nbsp; <b>F3</b> デバッグ &nbsp; <b>R</b> 世界を再生成 &nbsp; <b>+/-</b> 描画距離
+    <b>F</b> 飛行切替 &nbsp; <b>F3</b> デバッグ &nbsp; <b>R</b> 世界を再生成 &nbsp; <b>+/-</b> 描画距離 &nbsp; <b>J</b> Jevオートパイロット
   </div>
 
   <pre id="debug" class="panel"></pre>
+  <pre id="jev-log" class="panel"></pre>
+  <div id="jev-goal-banner"><div id="jev-goal-panel" class="panel">🌊 目標達成 — Jevが水のある場所に到達しました</div></div>
 
   <div id="loading">
     <div id="loading-text">世界を生成中<span class="dots"><span>.</span><span>.</span><span>.</span></span></div>
@@ -153,6 +172,7 @@
         <div class="keyrow"><span class="keycap">Space</span> ジャンプ / 上昇</div>
         <div class="keyrow"><span class="keycap">Shift</span> ダッシュ / 下降</div>
         <div class="keyrow"><span class="keycap">F</span> 飛行モード切替（初期は飛行）</div>
+        <div class="keyrow"><span class="keycap">J</span> Jevオートパイロット切替（目標: 水のある場所へ到達）</div>
       </div>
       <p id="start-cta">クリックして世界に入る →</p>
     </div>
@@ -988,6 +1008,173 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     camera.rotation.x = player.pitch;
   }
 
+  /* =========================================================
+     Jev オートパイロット
+     目標: 標高が海面(SEA_LEVEL)以下になる場所 = 水のある場所に到達する。
+     8方向それぞれの地形(標高・バイオーム)をJevに提示し、
+     どちらへ進めば海に近づけそうかを選ばせ、その方向へ一定時間飛行する
+     ---------------------------------------------------------
+     サーバー側 /api/run (Cloudflare Pages Functions) が
+     OpenRouter経由でJev(~typesafe/jev-latest)を呼び出す。
+     ========================================================= */
+  const JEV_ENDPOINT = '/api/run';
+  const JEV_DIRECTIONS = [
+    { key: 'n',  label: '北',   dx: 0,  dz: -1 },
+    { key: 'ne', label: '北東', dx: 1,  dz: -1 },
+    { key: 'e',  label: '東',   dx: 1,  dz: 0  },
+    { key: 'se', label: '南東', dx: 1,  dz: 1  },
+    { key: 's',  label: '南',   dx: 0,  dz: 1  },
+    { key: 'sw', label: '南西', dx: -1, dz: 1  },
+    { key: 'w',  label: '西',   dx: -1, dz: 0  },
+    { key: 'nw', label: '北西', dx: -1, dz: -1 }
+  ];
+  const JEV_SAMPLE_DISTS = [16, 40, 80];
+  const JEV_FLY_CLEARANCE = 9;   // オートパイロット中、地形からこの高さを保って飛ぶ
+  const JEV_LEG_DURATION = 2.6;  // 1回の方向決定でその方向へ進み続ける秒数
+
+  const jev = {
+    active: false,
+    goalReached: false,
+    thinking: false,
+    dir: null,
+    targetYaw: 0,
+    legTimer: 0
+  };
+
+  function jevSample(wx, wz) {
+    const h = gen.height(wx, wz);
+    return { h, biome: gen.biome(wx, wz, h) };
+  }
+
+  function jevDescribeDirection(dir) {
+    return JEV_SAMPLE_DISTS.map((dist) => {
+      const wx = Math.floor(player.pos.x + dir.dx * dist);
+      const wz = Math.floor(player.pos.z + dir.dz * dist);
+      const s = jevSample(wx, wz);
+      return dist + 'm先: 標高' + s.h + '(' + biomeLabel(s.biome) + ')';
+    }).join(' / ');
+  }
+
+  function jevBuildRequest() {
+    const here = jevSample(Math.floor(player.pos.x), Math.floor(player.pos.z));
+    const criteria = {};
+    JEV_DIRECTIONS.forEach((d) => { criteria[d.key] = d.label + ': ' + jevDescribeDirection(d); });
+    return {
+      state:
+        'ボクセル探索ゲーム。目標はキャラクターが水のある場所(標高が海面 ' + SEA_LEVEL + ' 以下になる地点)に到達すること。' +
+        '現在地の標高は' + here.h + '(バイオーム: ' + biomeLabel(here.biome) + ')。' +
+        'キャラクターは飛行中で障害物との衝突は自動で回避される。8方向それぞれについて、その方角に16m/40m/80m進んだ地点の標高とバイオームを示す。' +
+        '標高が低く「海」バイオームに近い方向ほど水に近い。僅差なら、より遠くまで一貫して標高が下がり続けている方向を優先してよい。',
+      questions: {
+        dir: {
+          type: 'choice',
+          instructions: '水のある場所に最短で近づけそうな方向を1つ選んでください。',
+          criteria
+        }
+      }
+    };
+  }
+
+  function jevUnwrapAnswers(json) {
+    if (json && typeof json === 'object') {
+      if (json.answers) return json.answers;
+      if (json.result && typeof json.result === 'object') return jevUnwrapAnswers(json.result);
+    }
+    return {};
+  }
+
+  async function jevPoll() {
+    jev.thinking = true;
+    const reqBody = jevBuildRequest();
+    jevLogEl.textContent = 'Jevに問い合わせ中…\n\n送信:\n' + JSON.stringify(reqBody, null, 2);
+    try {
+      const res = await fetch(JEV_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(reqBody)
+      });
+      const text = await res.text();
+      let json; try { json = JSON.parse(text); } catch (e) { json = null; }
+      if (!res.ok || json === null) throw new Error(json ? JSON.stringify(json) : text.slice(0, 300));
+      const ans = jevUnwrapAnswers(json).dir;
+      if (!ans || typeof ans.choice !== 'string') throw new Error('choiceが取得できません: ' + JSON.stringify(json));
+      const dir = JEV_DIRECTIONS.find((d) => d.key === ans.choice) || JEV_DIRECTIONS[0];
+      jev.dir = dir;
+      jev.targetYaw = Math.atan2(-dir.dx, -dir.dz);
+      jev.legTimer = JEV_LEG_DURATION;
+      jevLogEl.textContent =
+        '選んだ方向: ' + dir.label +
+        (ans.confidence !== undefined ? '  確信度: ' + Math.round(ans.confidence * 100) + '%' : '') +
+        '\n\n送信:\n' + JSON.stringify(reqBody, null, 2) + '\n\n受信:\n' + JSON.stringify(json, null, 2);
+    } catch (err) {
+      jevLogEl.textContent = 'Jev APIエラー: ' + (err && err.message ? err.message : err) +
+        '\n\nCloudflare Pagesの環境変数 OPENROUTER_API_KEY が設定されているか確認してください。';
+      jev.active = false;
+      hudJev.textContent = jevStatusText();
+    } finally {
+      jev.thinking = false;
+    }
+  }
+
+  function jevApproachYaw(current, target, rate) {
+    let diff = ((target - current + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    return current + diff * rate;
+  }
+
+  function jevCheckGoal() {
+    if (jev.goalReached) return;
+    const h = gen.height(Math.floor(player.pos.x), Math.floor(player.pos.z));
+    if (h <= SEA_LEVEL) {
+      jev.goalReached = true;
+      jev.active = false;
+      input.forward = false;
+      goalBannerEl.style.display = 'flex';
+      clearTimeout(jevCheckGoal._t);
+      jevCheckGoal._t = setTimeout(() => { goalBannerEl.style.display = 'none'; }, 7000);
+    }
+  }
+
+  function jevStatusText() {
+    if (jev.goalReached) return '🌊 到達！';
+    if (!jev.active) return 'OFF (J)';
+    if (jev.thinking) return '思考中…';
+    if (jev.dir) return '→ ' + jev.dir.label;
+    return '待機中';
+  }
+
+  function toggleAutopilot() {
+    jev.active = !jev.active;
+    jevLogEl.style.display = jev.active ? 'block' : 'none';
+    if (jev.active) {
+      jev.goalReached = false;
+      player.flying = true;
+      player.vel.set(0, 0, 0);
+      jev.dir = null;
+      jev.legTimer = 0;
+    } else {
+      input.forward = false;
+    }
+  }
+
+  function updateAutopilot(dt) {
+    if (!jev.active || jev.goalReached) return;
+
+    const groundH = gen.height(Math.floor(player.pos.x), Math.floor(player.pos.z));
+    const targetY = groundH + JEV_FLY_CLEARANCE;
+    player.pos.y += (targetY - player.pos.y) * Math.min(1, dt * 2.2);
+
+    if (jev.thinking) { input.forward = false; return; }
+    if (jev.legTimer <= 0) { jevPoll(); input.forward = false; return; }
+
+    if (jev.dir) {
+      player.yaw = jevApproachYaw(player.yaw, jev.targetYaw, Math.min(1, dt * 3));
+      input.forward = true; input.back = false; input.left = false; input.right = false;
+      input.jump = false; input.descend = false; input.sprint = true;
+      jev.legTimer -= dt;
+    }
+    jevCheckGoal();
+  }
+
   /* ---------- input ---------- */
   const keys = {};
   const input = { forward: false, back: false, left: false, right: false, jump: false, descend: false, sprint: false };
@@ -998,6 +1185,7 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     if (e.code === 'F3') { e.preventDefault(); debugVisible = !debugVisible; document.getElementById('debug').style.display = debugVisible ? 'block' : 'none'; }
     if (e.code === 'KeyF') { player.flying = !player.flying; player.vel.set(0, 0, 0); }
     if (e.code === 'KeyR') regenerateWorld();
+    if (e.code === 'KeyJ') toggleAutopilot();
     if (e.code === 'Equal' || e.code === 'NumpadAdd') RENDER_DISTANCE = clamp(RENDER_DISTANCE + 1, 3, 9);
     if (e.code === 'Minus' || e.code === 'NumpadSubtract') RENDER_DISTANCE = clamp(RENDER_DISTANCE - 1, 3, 9);
   });
@@ -1029,7 +1217,10 @@ function addTuft(pos, norm, uv, col, x, y, z) {
   const hudBiome = document.getElementById('hud-biome');
   const hudTime = document.getElementById('hud-time');
   const hudMode = document.getElementById('hud-mode');
+  const hudJev = document.getElementById('hud-jev');
   const debugEl = document.getElementById('debug');
+  const jevLogEl = document.getElementById('jev-log');
+  const goalBannerEl = document.getElementById('jev-goal-banner');
 
   function biomeLabel(b) {
     return ({
@@ -1050,6 +1241,7 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     const minute = Math.floor(((((dayInfo.cycle + 0.25) % 1) * 24) % 1) * 60);
     hudTime.textContent = String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
     hudMode.textContent = player.flying ? '飛行' : '徒歩';
+    hudJev.textContent = jevStatusText();
     if (debugVisible) {
       debugEl.textContent =
         'chunks loaded: ' + chunks.size + '\n' +
@@ -1074,6 +1266,7 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     if (fpsAccum >= 0.5) { fps = Math.round(fpsFrames / fpsAccum); fpsAccum = 0; fpsFrames = 0; }
 
     syncInputFromKeys();
+    updateAutopilot(dt);
     updatePlayer(dt, input);
 
     chunkTimer += dt;

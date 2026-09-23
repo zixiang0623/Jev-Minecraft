@@ -10,46 +10,32 @@
 
 ## 構成
 
-- `index.html` — フロントエンド(単一HTMLファイル)。ゲーム本体 + Jevオートパイロット。`POST /api/run` を叩く
-- `functions/api/run.js` — Cloudflare Pages Function。**Cloudflare AI Gateway** を経由してOpenRouter(`~typesafe/jev-latest`)を呼ぶ
-  (zixiang0623/Jev-Openrouter の `api/run.js` と同じリクエスト/レスポンス契約を保ったまま、呼び出し先だけをAI Gatewayに変更したもの)
-- `wrangler.toml` — Cloudflare Pages / Wrangler 用の設定
+zixiang0623/Jev と全く同じ方式(Cloudflare Workers + 静的アセット + Workers AI binding)を採用。
+OpenRouterのAPIキーもCloudflare AI Gatewayのアカウント情報も**一切不要**——
+Workers AI bindingがアカウントに紐づいた形でJevモデルを直接呼び出す。
 
-APIキーをブラウザに置かず、サーバー側(Cloudflare Pages Functions)にだけ持たせるための構成。
+- `public/index.html` — フロントエンド(単一HTMLファイル)。ゲーム本体 + Jevオートパイロット。`POST /api/run` を叩く
+- `src/index.js` — Cloudflare Worker本体。POSTを受けたら `env.AI.run("typesafe/jev", body)` でJevを呼ぶ。
+  GET/HEADなど静的配信は `env.ASSETS` にそのまま渡す(zixiang0623/Jev の `src/index.js` と同一方式)
+- `wrangler.jsonc` — `assets.directory` で `public/` を配信し、`ai.binding = "AI"` でWorkers AIを有効化
 
-## デプロイ手順(Cloudflare Pages)
+## デプロイ手順(Cloudflare Workers)
 
-1. Cloudflareダッシュボード → Workers & Pages → Create → Pages → **Connect to Git** で、このリポジトリを選択
-2. ビルド設定: Framework preset は `None`、Build command は空、Build output directory は `/`(ルート)のまま
-3. Cloudflareダッシュボード → AI → **AI Gateway** で新しいゲートウェイを作成し、Account ID とゲートウェイ名を控える
-4. Pages プロジェクトの Settings → Environment variables に以下を追加(Production / Preview 両方、Secretとして暗号化推奨)
-   - `OPENROUTER_API_KEY` — 自分のOpenRouter APIキー
-   - `CF_AI_GATEWAY_ACCOUNT_ID` — 上記のAccount ID
-   - `CF_AI_GATEWAY_ID` — 上記のゲートウェイ名
-   - `CF_AI_GATEWAY_TOKEN` — (任意)ゲートウェイでAuthenticated Gatewayを有効にしている場合のみ
-5. Deploy(以後は `main` へのpushで自動デプロイ)
-
-呼び出し先は `https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/openrouter/alpha/decisions` になる
-(Cloudflareの OpenRouterプロキシ規則 `https://openrouter.ai/api/... → .../openrouter/...` に、OpenRouterの
-alphaエンドポイント `/api/alpha/decisions` を当てはめたもの)。ゲートウェイ作成後、ダッシュボードの
-「AI Gateway → 該当ゲートウェイ → Logs」で実際にリクエストが届いているか確認できる。
-
-### Wrangler CLIでデプロイする場合
+環境変数・シークレットの設定は不要。
 
 ```bash
 npm i -g wrangler
-wrangler pages deploy . --project-name=jev-minecraft
-wrangler pages secret put OPENROUTER_API_KEY --project-name=jev-minecraft
-wrangler pages secret put CF_AI_GATEWAY_ACCOUNT_ID --project-name=jev-minecraft
-wrangler pages secret put CF_AI_GATEWAY_ID --project-name=jev-minecraft
+wrangler login
+wrangler deploy
 ```
+
+GitHub連携で自動デプロイしたい場合は、Cloudflareダッシュボード → Workers & Pages → Create →
+**Import a repository** でこのリポジトリを接続する(Build commandは不要、`wrangler.jsonc` がそのまま使われる)。
 
 ## ローカルで動かす場合
 
 ```bash
-npm i -g wrangler
-wrangler pages dev .
+wrangler dev
 ```
 
-`OPENROUTER_API_KEY` はローカルでは `.dev.vars` ファイル(`.gitignore`済み、コミットしないこと)に
-`OPENROUTER_API_KEY=sk-or-...` の形式で書いておくと `wrangler pages dev` が読み込む。
+Workers AI bindingはローカルでもCloudflareアカウントの認証(`wrangler login`)があればそのまま動く。

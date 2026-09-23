@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -151,7 +152,7 @@
         <div class="keyrow"><span class="keycap">マウス</span> 視点操作</div>
         <div class="keyrow"><span class="keycap">Space</span> ジャンプ / 上昇</div>
         <div class="keyrow"><span class="keycap">Shift</span> ダッシュ / 下降</div>
-        <div class="keyrow"><span class="keycap">F</span> 飛行モード切替（初期は飛���）</div>
+        <div class="keyrow"><span class="keycap">F</span> 飛行モード切替（初期は飛行）</div>
       </div>
       <p id="start-cta">クリックして世界に入る →</p>
     </div>
@@ -943,9 +944,8 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     const forward = new THREE.Vector3(Math.sin(player.yaw), 0, Math.cos(player.yaw));
     const right = new THREE.Vector3(Math.sin(player.yaw + Math.PI / 2), 0, Math.cos(player.yaw + Math.PI / 2));
     let moveX = 0, moveZ = 0;
-    // 前後移動を反転: 前進入力で後退、後退入力で前進
-    if (input.forward) { moveX -= forward.x; moveZ -= forward.z; }
-    if (input.back) { moveX += forward.x; moveZ += forward.z; }
+    if (input.forward) { moveX += forward.x; moveZ += forward.z; }
+    if (input.back) { moveX -= forward.x; moveZ -= forward.z; }
     if (input.right) { moveX += right.x; moveZ += right.z; }
     if (input.left) { moveX -= right.x; moveZ -= right.z; }
     const len = Math.hypot(moveX, moveZ);
@@ -998,4 +998,111 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     if (e.code === 'F3') { e.preventDefault(); debugVisible = !debugVisible; document.getElementById('debug').style.display = debugVisible ? 'block' : 'none'; }
     if (e.code === 'KeyF') { player.flying = !player.flying; player.vel.set(0, 0, 0); }
     if (e.code === 'KeyR') regenerateWorld();
-[...]
+    if (e.code === 'Equal' || e.code === 'NumpadAdd') RENDER_DISTANCE = clamp(RENDER_DISTANCE + 1, 3, 9);
+    if (e.code === 'Minus' || e.code === 'NumpadSubtract') RENDER_DISTANCE = clamp(RENDER_DISTANCE - 1, 3, 9);
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+  function syncInputFromKeys() {
+    input.forward = !!keys['KeyW']; input.back = !!keys['KeyS'];
+    input.left = !!keys['KeyA']; input.right = !!keys['KeyD'];
+    input.jump = !!keys['Space']; input.descend = !!keys['ShiftLeft'] || !!keys['ShiftRight'];
+    input.sprint = !!keys['ShiftLeft'] || !!keys['ShiftRight'];
+  }
+
+  const startOverlay = document.getElementById('start');
+  const canvasEl = renderer.domElement;
+  startOverlay.addEventListener('click', () => { canvasEl.requestPointerLock(); });
+  document.addEventListener('pointerlockchange', () => {
+    const locked = document.pointerLockElement === canvasEl;
+    startOverlay.style.display = locked ? 'none' : 'flex';
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (document.pointerLockElement !== canvasEl) return;
+    player.yaw -= e.movementX * 0.0022;
+    player.pitch -= e.movementY * 0.0022;
+    player.pitch = clamp(player.pitch, -Math.PI / 2 + 0.01, Math.PI / 2 - 0.01);
+  });
+
+  /* ---------- HUD ---------- */
+  const hudCoords = document.getElementById('hud-coords');
+  const hudBiome = document.getElementById('hud-biome');
+  const hudTime = document.getElementById('hud-time');
+  const hudMode = document.getElementById('hud-mode');
+  const debugEl = document.getElementById('debug');
+
+  function biomeLabel(b) {
+    return ({
+      ocean: '海', beach: '浜辺', desert: '砂漠', tundra: '雪原',
+      peak: '山頂', forest: '森', plains: '平原'
+    })[b] || b;
+  }
+
+  let fps = 0, fpsAccum = 0, fpsFrames = 0;
+
+  function updateHUD(dayInfo) {
+    const wx = Math.floor(player.pos.x), wy = Math.floor(player.pos.y), wz = Math.floor(player.pos.z);
+    hudCoords.textContent = 'X ' + wx + '  Y ' + wy + '  Z ' + wz;
+    const h = gen.height(wx, wz);
+    const biome = gen.biome(wx, wz, h);
+    hudBiome.textContent = biomeLabel(biome);
+    const hour = Math.floor(((dayInfo.cycle + 0.25) % 1) * 24);
+    const minute = Math.floor(((((dayInfo.cycle + 0.25) % 1) * 24) % 1) * 60);
+    hudTime.textContent = String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0');
+    hudMode.textContent = player.flying ? '飛行' : '徒歩';
+    if (debugVisible) {
+      debugEl.textContent =
+        'chunks loaded: ' + chunks.size + '\n' +
+        'queue: ' + genQueue.length + '\n' +
+        'render distance: ' + RENDER_DISTANCE + '\n' +
+        'fps: ' + fps + '\n' +
+        'seed: ' + worldSeed;
+    }
+  }
+
+  /* ---------- main loop ---------- */
+  let last = performance.now();
+  let chunkTimer = 0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    let dt = (now - last) / 1000;
+    if (dt > 0.12) dt = 0.12;
+    last = now;
+
+    fpsAccum += dt; fpsFrames++;
+    if (fpsAccum >= 0.5) { fps = Math.round(fpsFrames / fpsAccum); fpsAccum = 0; fpsFrames = 0; }
+
+    syncInputFromKeys();
+    updatePlayer(dt, input);
+
+    chunkTimer += dt;
+    if (chunkTimer > 0.15) { requestChunksAround(player.pos.x, player.pos.z); chunkTimer = 0; }
+    for (let i = 0; i < 2; i++) generateOne();
+
+    const dayInfo = updateDayNight(dt, player.pos);
+    updateHUD(dayInfo);
+
+    renderer.render(scene, camera);
+  }
+
+  /* ---------- boot ---------- */
+  function boot() {
+    // let the browser paint the loading screen before the heavy synchronous
+    // world-generation work below begins
+    requestAnimationFrame(() => setTimeout(() => {
+      const h = gen.height(0, 0) + 3;
+      player.pos.set(0.5, h, 0.5);
+      requestChunksAround(player.pos.x, player.pos.z);
+      for (let i = 0; i < 13; i++) generateOne();
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('start').style.display = 'flex';
+      last = performance.now();
+      requestAnimationFrame(frame);
+    }, 30));
+  }
+  boot();
+})();
+</script>
+</body>
+</html>

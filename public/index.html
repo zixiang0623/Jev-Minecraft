@@ -1012,10 +1012,12 @@ function addTuft(pos, norm, uv, col, x, y, z) {
      Jev オートパイロット
      目標: 標高が海面(SEA_LEVEL)以下になる場所 = 水のある場所に到達する。
      8方向それぞれの地形(標高・バイオーム)をJevに提示し、
-     どちらへ進めば海に近づけそうかを選ばせ、その方向へ一定時間飛行する
+     どちらへ進めば海に近づけそうかを選ばせる。
+     飛行は使わず徒歩のみ。1ブロック進むごとに毎回Jevへ問い合わせる
+     (トークン消費は多いが、細かい単位で判断させる方針)。
      ---------------------------------------------------------
-     サーバー側 /api/run (Cloudflare Pages Functions) が
-     OpenRouter経由でJev(~typesafe/jev-latest)を呼び出す。
+     サーバー側 /api/run (Cloudflare Workers, env.AI binding) が
+     Jev(typesafe/jev)を呼び出す。
      ========================================================= */
   const JEV_ENDPOINT = '/api/run';
   const JEV_DIRECTIONS = [
@@ -1029,8 +1031,8 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     { key: 'nw', label: '北西', dx: -1, dz: -1 }
   ];
   const JEV_SAMPLE_DISTS = [16, 40, 80];
-  const JEV_FLY_CLEARANCE = 9;   // オートパイロット中、地形からこの高さを保って飛ぶ
-  const JEV_LEG_DURATION = 2.6;  // 1回の方向決定でその方向へ進み続ける秒数
+  const JEV_LEG_DISTANCE = 1;    // 1回の方向決定で進む距離(ブロック) = 毎回リクエスト
+  const JEV_LEG_TIMEOUT = 2.5;   // 壁などに阻まれて進めない場合の強制再問い合わせ秒数
 
   const jev = {
     active: false,
@@ -1038,7 +1040,10 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     thinking: false,
     dir: null,
     targetYaw: 0,
-    legTimer: 0
+    needsJump: false,
+    legStartX: 0,
+    legStartZ: 0,
+    legTime: 0
   };
 
   function jevSample(wx, wz) {
@@ -1063,7 +1068,8 @@ function addTuft(pos, norm, uv, col, x, y, z) {
       state:
         'ボクセル探索ゲーム。目標はキャラクターが水のある場所(標高が海面 ' + SEA_LEVEL + ' 以下になる地点)に到達すること。' +
         '現在地の標高は' + here.h + '(バイオーム: ' + biomeLabel(here.biome) + ')。' +
-        'キャラクターは飛行中で障害物との衝突は自動で回避される。8方向それぞれについて、その方角に16m/40m/80m進んだ地点の標高とバイオームを示す。' +
+        'キャラクターは徒歩で、1ブロック(約1m)進むごとに次の方向を選び直す。段差1ブロック程度は自動でジャンプするが、崖など大きな段差は越えられない。' +
+        '8方向それぞれについて、その方角に16m/40m/80m進んだ地点の標高とバイオームを示す。' +
         '標高が低く「海」バイオームに近い方向ほど水に近い。僅差なら、より遠くまで一貫して標高が下がり続けている方向を優先してよい。',
       questions: {
         dir: {
@@ -1099,16 +1105,21 @@ function addTuft(pos, norm, uv, col, x, y, z) {
       const ans = jevUnwrapAnswers(json).dir;
       if (!ans || typeof ans.choice !== 'string') throw new Error('choiceが取得できません: ' + JSON.stringify(json));
       const dir = JEV_DIRECTIONS.find((d) => d.key === ans.choice) || JEV_DIRECTIONS[0];
+      const here = jevSample(Math.floor(player.pos.x), Math.floor(player.pos.z));
+      const next = jevSample(Math.floor(player.pos.x + dir.dx), Math.floor(player.pos.z + dir.dz));
       jev.dir = dir;
       jev.targetYaw = Math.atan2(-dir.dx, -dir.dz);
-      jev.legTimer = JEV_LEG_DURATION;
+      jev.needsJump = (next.h - here.h) >= 1;
+      jev.legStartX = player.pos.x;
+      jev.legStartZ = player.pos.z;
+      jev.legTime = 0;
       jevLogEl.textContent =
         '選んだ方向: ' + dir.label +
         (ans.confidence !== undefined ? '  確信度: ' + Math.round(ans.confidence * 100) + '%' : '') +
         '\n\n送信:\n' + JSON.stringify(reqBody, null, 2) + '\n\n受信:\n' + JSON.stringify(json, null, 2);
     } catch (err) {
       jevLogEl.textContent = 'Jev APIエラー: ' + (err && err.message ? err.message : err) +
-        '\n\nCloudflare Pagesの環境変数 OPENROUTER_API_KEY が設定されているか確認してください。';
+        '\n\nCloudflareアカウントでWorkers AIが有効か、Jevモデルへのアクセス権があるか確認してください。';
       jev.active = false;
       hudJev.textContent = jevStatusText();
     } finally {
@@ -1147,10 +1158,12 @@ function addTuft(pos, norm, uv, col, x, y, z) {
     jevLogEl.style.display = jev.active ? 'block' : 'none';
     if (jev.active) {
       jev.goalReached = false;
-      player.flying = true;
+      player.flying = false;
       player.vel.set(0, 0, 0);
       jev.dir = null;
-      jev.legTimer = 0;
+      jev.legTime = 0;
+      jev.legStartX = player.pos.x;
+      jev.legStartZ = player.pos.z;
     } else {
       input.forward = false;
     }
@@ -1159,19 +1172,21 @@ function addTuft(pos, norm, uv, col, x, y, z) {
   function updateAutopilot(dt) {
     if (!jev.active || jev.goalReached) return;
 
-    const groundH = gen.height(Math.floor(player.pos.x), Math.floor(player.pos.z));
-    const targetY = groundH + JEV_FLY_CLEARANCE;
-    player.pos.y += (targetY - player.pos.y) * Math.min(1, dt * 2.2);
-
     if (jev.thinking) { input.forward = false; return; }
-    if (jev.legTimer <= 0) { jevPoll(); input.forward = false; return; }
 
-    if (jev.dir) {
-      player.yaw = jevApproachYaw(player.yaw, jev.targetYaw, Math.min(1, dt * 3));
-      input.forward = true; input.back = false; input.left = false; input.right = false;
-      input.jump = false; input.descend = false; input.sprint = true;
-      jev.legTimer -= dt;
+    if (!jev.dir) { jevPoll(); input.forward = false; return; }
+
+    const traveled = Math.hypot(player.pos.x - jev.legStartX, player.pos.z - jev.legStartZ);
+    jev.legTime += dt;
+    if (traveled >= JEV_LEG_DISTANCE || jev.legTime >= JEV_LEG_TIMEOUT) {
+      jevPoll();
+      input.forward = false;
+      return;
     }
+
+    player.yaw = jevApproachYaw(player.yaw, jev.targetYaw, Math.min(1, dt * 4));
+    input.forward = true; input.back = false; input.left = false; input.right = false;
+    input.jump = jev.needsJump; input.descend = false; input.sprint = true;
     jevCheckGoal();
   }
 
